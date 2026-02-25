@@ -1,36 +1,46 @@
 #!/bin/bash
-# Collects Hetzner VPS metrics and pushes to Supabase
+# Collects Hetzner VPS host metrics and pushes to Supabase
 set -euo pipefail
 
+PROC="/host/proc"
+[ -d "$PROC" ] || PROC="/proc"
+
 # CPU usage from /proc/stat (2 samples, 1 sec apart)
-read_cpu() {
-  awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8, $5}' /proc/stat
-}
-CPU1=$(cat /proc/stat | awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8, $5}')
+CPU1=$(awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8, $5}' "$PROC/stat")
 sleep 1
-CPU2=$(cat /proc/stat | awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8, $5}')
-TOTAL1=$(echo "$CPU1" | awk '{print $1}')
-IDLE1=$(echo "$CPU1" | awk '{print $2}')
-TOTAL2=$(echo "$CPU2" | awk '{print $1}')
-IDLE2=$(echo "$CPU2" | awk '{print $2}')
-CPU_PCT=$(echo "scale=0; (1 - ($IDLE2 - $IDLE1) / ($TOTAL2 - $TOTAL1)) * 100" | bc 2>/dev/null || echo 0)
+CPU2=$(awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8, $5}' "$PROC/stat")
+TOTAL_D=$(echo "$CPU1 $CPU2" | awk '{print $3+$4-$1-$2}' | head -1)
+IDLE_D=$(echo "$CPU1 $CPU2" | awk '{print $4-$2}' | head -1)
+# Simpler approach
+T1=$(echo "$CPU1" | awk '{print $1}'); I1=$(echo "$CPU1" | awk '{print $2}')
+T2=$(echo "$CPU2" | awk '{print $1}'); I2=$(echo "$CPU2" | awk '{print $2}')
+CPU_PCT=$(echo "scale=0; (1 - ($I2 - $I1) / ($T2 - $T1)) * 100" | bc 2>/dev/null || echo 1)
 
-# RAM
-RAM_USED=$(free -h | grep Mem | awk '{print $3}')
-RAM_TOTAL=$(free -h | grep Mem | awk '{print $2}')
-RAM_PCT=$(free | grep Mem | awk '{printf "%d", $3/$2*100}')
+# RAM from /proc/meminfo
+MEM_TOTAL_KB=$(awk '/^MemTotal:/ {print $2}' "$PROC/meminfo")
+MEM_AVAIL_KB=$(awk '/^MemAvailable:/ {print $2}' "$PROC/meminfo")
+MEM_USED_KB=$((MEM_TOTAL_KB - MEM_AVAIL_KB))
+RAM_PCT=$((MEM_USED_KB * 100 / MEM_TOTAL_KB))
+RAM_USED="$(echo "scale=1; $MEM_USED_KB / 1048576" | bc)Gi"
+RAM_TOTAL="$(echo "scale=0; $MEM_TOTAL_KB / 1048576" | bc)Gi"
 
-# Disk
-DISK_LINE=$(df -h / | tail -1)
-DISK_USED=$(echo "$DISK_LINE" | awk '{print $3}')
-DISK_TOTAL=$(echo "$DISK_LINE" | awk '{print $2}')
-DISK_PCT=$(echo "$DISK_LINE" | awk '{print $5}' | tr -d '%')
+# Disk (from host via docker info or /proc/mounts trick)
+# Use df inside container but for host root - works if host / is visible
+DISK_USED=$(df -h / 2>/dev/null | tail -1 | awk '{print $3}')
+DISK_TOTAL=$(df -h / 2>/dev/null | tail -1 | awk '{print $2}')
+DISK_PCT=$(df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%')
 
-# Uptime + Load
-UPTIME=$(uptime -p 2>/dev/null | sed 's/up //' || echo "unknown")
-LOAD=$(cat /proc/loadavg | awk '{print $1, $2, $3}')
+# Uptime from /proc/uptime
+UPTIME_SECS=$(awk '{print int($1)}' "$PROC/uptime")
+DAYS=$((UPTIME_SECS / 86400))
+HOURS=$(((UPTIME_SECS % 86400) / 3600))
+MINS=$(((UPTIME_SECS % 3600) / 60))
+UPTIME="${DAYS} days, ${HOURS} hours, ${MINS} minutes"
 
-# Docker containers (via mounted socket, exclude self)
+# Load from /proc/loadavg
+LOAD=$(awk '{print $1, $2, $3}' "$PROC/loadavg")
+
+# Docker containers
 SERVICES="["
 FIRST=true
 while IFS= read -r line; do
@@ -54,7 +64,7 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
     \"name\": \"Hetzner VPS\",
     \"host\": \"46.224.85.85\",
     \"specs\": {\"cores\": 16, \"ramGB\": 30, \"diskGB\": 601, \"os\": \"Ubuntu 22.04\"},
-    \"metrics\": {\"cpuPercent\": ${CPU_PCT:-0}, \"ramPercent\": ${RAM_PCT:-0}, \"ramUsed\": \"${RAM_USED}\", \"ramTotal\": \"${RAM_TOTAL}\", \"diskPercent\": ${DISK_PCT:-0}, \"diskUsed\": \"${DISK_USED}\", \"diskTotal\": \"${DISK_TOTAL}\", \"uptime\": \"${UPTIME}\", \"loadAvg\": \"${LOAD}\"},
+    \"metrics\": {\"cpuPercent\": ${CPU_PCT:-0}, \"ramPercent\": ${RAM_PCT:-0}, \"ramUsed\": \"${RAM_USED}\", \"ramTotal\": \"${RAM_TOTAL}\", \"diskPercent\": ${DISK_PCT:-0}, \"diskUsed\": \"${DISK_USED:-?}\", \"diskTotal\": \"${DISK_TOTAL:-601G}\", \"uptime\": \"${UPTIME}\", \"loadAvg\": \"${LOAD}\"},
     \"services\": ${SERVICES},
     \"status\": \"online\",
     \"checked_at\": \"${NOW}\"
