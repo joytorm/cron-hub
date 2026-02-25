@@ -1,0 +1,2 @@
+*/2 * * * * /scripts/collect-hetzner-metrics.sh >> /var/log/cron-hub.log 2>&1
+0 4 * * * /scripts/cleanup-old-metrics.sh >> /var/log/cron-hub.log 2>&1
